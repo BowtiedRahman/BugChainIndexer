@@ -196,13 +196,24 @@ class Scanner {
       });
       
       const blockNumber = parseInt(result);
-      
+
       // Simple validation - ensure reasonable block number
       if (blockNumber <= 0 ) {
         this.log(`Invalid block number ${blockNumber} from API, using current block`, 'warn');
         return await this.getBlockNumber(); // Return current block as fallback
       }
-      
+
+      // Validate the resolved block is actually near the target timestamp.
+      // A stale/wrong API answer here would make the scan window span weeks.
+      const block = await this.getBlockByNumber(blockNumber);
+      const blockTime = parseInt(block.timestamp, 16);
+      const driftSeconds = Math.abs(blockTime - targetTimestamp);
+      const maxDriftSeconds = 2 * 60 * 60; // 2h; target window is TIMEDELAY_HOURS (default 4h)
+      if (driftSeconds > maxDriftSeconds) {
+        this.log(`Block ${blockNumber} is ${Math.round(driftSeconds / 60)}min from target ${new Date(targetTimestamp * 1000).toISOString()}, rejecting (max 2h drift)`, 'warn');
+        return await this.getBlockNumber();
+      }
+
       return blockNumber;
     } catch (error) {
       this.log(`Failed to get block by timestamp via API: ${error.message}`, 'warn');

@@ -348,7 +348,14 @@ class UnifiedScanner extends Scanner {
       fund: 0,
       lastFundUpdated: 0,
       nameChecked: contract.verified || false,
-      nameCheckedAt: contract.verified ? this.currentTime : 0
+      nameCheckedAt: contract.verified ? this.currentTime : 0,
+      verified: contract.verified || false,
+      proxy: contract.proxy || false,
+      implementation: contract.implementation || null,
+      compilerVersion: contract.compilerVersion || null,
+      licenseType: contract.licenseType || null,
+      sourceCode: contract.sourceCode || null,
+      abi: contract.abi || null
     }));
 
     // Prepare self-destroyed contract data
@@ -400,9 +407,12 @@ class UnifiedScanner extends Scanner {
     const maxProcessingQueue = PROCESSING.MAX_CONCURRENT_PROCESSING;
     
     // Adaptive batch sizing parameters
-    let currentBatchSize = BATCH_SIZES.LOGS_DEFAULT;
+    // Some RPC providers (Alchemy free tier) cap the eth_getLogs block range.
+    // Clamp the starting batch so the adaptive shrinker never has to discover it.
+    const networkRangeCap = this.config.maxLogBlockRange || BATCH_SIZES.LOGS_MAX;
+    let currentBatchSize = Math.min(BATCH_SIZES.LOGS_DEFAULT, networkRangeCap);
     const minBatchSize = BATCH_SIZES.LOGS_MIN;
-    const maxBatchSize = BATCH_SIZES.LOGS_MAX;
+    const maxBatchSize = Math.min(BATCH_SIZES.LOGS_MAX, networkRangeCap);
     
     let currentBlock = fromBlock;
     

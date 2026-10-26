@@ -21,7 +21,60 @@ async function ensureSchema(client) {
       name_checked_at BIGINT NOT NULL DEFAULT 0,
       PRIMARY KEY (address, network)
     )`,
-    
+
+    // Enrichment columns for bug-hunt analysis. Added lazily so existing
+    // deployments upgrade in place without a manual migration step.
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT false`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS proxy BOOLEAN DEFAULT false`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS implementation TEXT`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS compiler_version TEXT`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS license_type TEXT`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS source_code TEXT`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS abi JSONB`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS deployer TEXT`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS deploy_tx TEXT`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS risk_score SMALLINT DEFAULT 0`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS risk_reasons TEXT[] DEFAULT '{}'`,
+
+    // Funding gate lifecycle: every row starts as 'candidate' and is either
+    // promoted to 'funded' by FundingGate or left as a cheap candidate row.
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'candidate'`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS funded_at BIGINT`,
+    `ALTER TABLE addresses ADD COLUMN IF NOT EXISTS balance_checked_at BIGINT NOT NULL DEFAULT 0`,
+
+    `CREATE INDEX IF NOT EXISTS idx_addr_risk ON addresses(network, risk_score DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_addr_deployer ON addresses(network, deployer)`,
+    `CREATE INDEX IF NOT EXISTS idx_addr_proxy ON addresses(network) WHERE proxy`,
+    `CREATE INDEX IF NOT EXISTS idx_addr_unverified_funded
+       ON addresses(network, fund DESC) WHERE verified = false`,
+    `CREATE INDEX IF NOT EXISTS idx_addr_gate
+       ON addresses(network, status, balance_checked_at)`,
+
+    // Existing rows predate the gate. Mark them candidates so the gate sees them.
+    // Rows that already carry a fund value are promoted immediately, they were
+    // found funded by the unified scanner and don't need a gate pass.
+    `UPDATE addresses SET status = 'candidate' WHERE status IS NULL`,
+    `UPDATE addresses SET status = 'funded', funded_at = ${'COALESCE(funded_at, last_fund_updated)'} WHERE status = 'candidate' AND fund > 0`,
+
+    // Proxy upgrades. A proxy pointing at a fresh implementation is the
+    // highest-signal bug-hunt feed, so it gets its own table.
+    `CREATE TABLE IF NOT EXISTS upgrades (
+      proxy TEXT NOT NULL,
+      implementation TEXT NOT NULL,
+      block_number BIGINT NOT NULL,
+      tx_hash TEXT NOT NULL,
+      network TEXT NOT NULL,
+      detected_at BIGINT NOT NULL,
+      PRIMARY KEY (proxy, implementation, network)
+    )`,
+
+    // Deployment cursor: one row per network, the last fully scanned block.
+    `CREATE TABLE IF NOT EXISTS scan_cursor (
+      network TEXT PRIMARY KEY,
+      last_block BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+
     // Essential indexes for performance - optimized for common queries
     `CREATE INDEX IF NOT EXISTS idx_addresses_network ON addresses(network)`,
     `CREATE INDEX IF NOT EXISTS idx_addresses_tags_gin ON addresses USING GIN(tags)`,
@@ -108,19 +161,33 @@ async function batchUpsertAddresses(client, addresses, options = {}) {
         data.fund || 0,
         data.lastFundUpdated || 0,
         data.nameChecked || false,
-        data.nameCheckedAt || 0
+        data.nameCheckedAt || 0,
+        data.verified ?? false,
+        data.proxy ?? false,
+        data.implementation || null,
+        data.compilerVersion || null,
+        data.licenseType || null,
+        data.sourceCode || null,
+        data.abi ? JSON.stringify(data.abi) : null,
+        data.deployer || null,
+        data.deployTx || null,
+        data.riskScore || 0,
+        data.riskReasons || []
       ];
-      
+
       const placeholders = rowParams.map(() => `$${paramIndex++}`).join(', ');
       values.push(`(${placeholders})`);
       params.push(...rowParams);
     }
-    
+
     const query = `
       INSERT INTO addresses (
         address, code_hash, contract_name, deployed,
         last_updated, network, first_seen, tags,
-        fund, last_fund_updated, name_checked, name_checked_at
+        fund, last_fund_updated, name_checked, name_checked_at,
+        verified, proxy, implementation, compiler_version,
+        license_type, source_code, abi, deployer, deploy_tx,
+        risk_score, risk_reasons
       ) VALUES ${values.join(', ')}
       ON CONFLICT (address, network) DO UPDATE SET
         code_hash = COALESCE(EXCLUDED.code_hash, addresses.code_hash),
@@ -132,7 +199,20 @@ async function batchUpsertAddresses(client, addresses, options = {}) {
         fund = COALESCE(EXCLUDED.fund, addresses.fund),
         last_fund_updated = COALESCE(EXCLUDED.last_fund_updated, addresses.last_fund_updated),
         name_checked = COALESCE(EXCLUDED.name_checked, addresses.name_checked),
-        name_checked_at = COALESCE(EXCLUDED.name_checked_at, addresses.name_checked_at)
+        name_checked_at = COALESCE(EXCLUDED.name_checked_at, addresses.name_checked_at),
+        verified = COALESCE(EXCLUDED.verified, addresses.verified),
+        proxy = COALESCE(EXCLUDED.proxy, addresses.proxy),
+        implementation = COALESCE(EXCLUDED.implementation, addresses.implementation),
+        compiler_version = COALESCE(EXCLUDED.compiler_version, addresses.compiler_version),
+        license_type = COALESCE(EXCLUDED.license_type, addresses.license_type),
+        source_code = COALESCE(EXCLUDED.source_code, addresses.source_code),
+        abi = COALESCE(EXCLUDED.abi, addresses.abi),
+        deployer = COALESCE(EXCLUDED.deployer, addresses.deployer),
+        deploy_tx = COALESCE(EXCLUDED.deploy_tx, addresses.deploy_tx),
+        risk_score = GREATEST(EXCLUDED.risk_score, addresses.risk_score),
+        risk_reasons = CASE
+          WHEN array_length(EXCLUDED.risk_reasons, 1) > 0 THEN EXCLUDED.risk_reasons
+          ELSE addresses.risk_reasons END
     `;
     
     const result = await client.query(query, params);

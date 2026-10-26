@@ -252,6 +252,22 @@ main() {
             fi
             ;;
             
+        "deployments"|"DeploymentScanner")
+            if [[ -n "$network" ]]; then
+                lock_and_run "deploy-$network" "run_network DeploymentScanner $network"
+            else
+                lock_and_run "deploy-parallel" "run_parallel DeploymentScanner"
+            fi
+            ;;
+
+        "gate"|"FundingGate")
+            if [[ -n "$network" ]]; then
+                lock_and_run "gate-$network" "run_network FundingGate $network"
+            else
+                lock_and_run "gate-parallel" "run_parallel FundingGate"
+            fi
+            ;;
+
         "unified"|"UnifiedScanner")
             log "🔍 Starting UnifiedScanner pipeline${network:+ for $network} ($mode mode)..."
             if [[ -n "$network" ]]; then

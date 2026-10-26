@@ -41,7 +41,10 @@ const NETWORKS = {
     apiKeys: DEFAULT_ETHERSCAN_KEYS,
     contractValidator: '0xfE53a230a2AEd6E52f2dEf488DA408d47a80A8bF',
     BalanceHelper: '0x5CD47B1F62e3BD40C669024CA52B40946C8b641b',
-    nativeCurrency: 'ETH'
+    nativeCurrency: 'ETH',
+    // Alchemy free tier caps eth_getLogs at a 10-block range on mainnet.
+    // Keep the batch under that so the scanner doesn't timeout-halve endlessly.
+    maxLogBlockRange: 8
   },
 
   binance: {
