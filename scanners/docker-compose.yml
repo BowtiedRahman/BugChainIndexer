@@ -1,0 +1,128 @@
+# BugChainIndexer - full stack on one host.
+#
+#   cp .env.cloud.example .env   # fill in keys
+#   docker compose up -d
+#
+# Every service restarts on crash or reboot (restart: always). The Postgres
+# volume survives rebuilds; `docker compose down -v` is the only way to lose
+# indexed data.
+
+x-scanner-env: &scanner-env
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGDATABASE: bugchain_indexer
+  PGUSER: ${PGUSER:-postgres}
+  PGPASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
+  DEFAULT_ETHERSCAN_KEYS: ${DEFAULT_ETHERSCAN_KEYS:?set DEFAULT_ETHERSCAN_KEYS in .env}
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+  TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+  PROMOTE_MIN_USD: ${PROMOTE_MIN_USD:-1000}
+  MAX_DEPLOY_AGE_HOURS: ${MAX_DEPLOY_AGE_HOURS:-24}
+  GATE_RECHECK_SECONDS: ${GATE_RECHECK_SECONDS:-900}
+  GATE_BATCH: ${GATE_BATCH:-500}
+  CONFIRMATIONS: ${CONFIRMATIONS:-3}
+  DEPLOY_CHUNK: ${DEPLOY_CHUNK:-100}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${PGUSER:-postgres}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
+      POSTGRES_DB: bugchain_indexer
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-postgres} -d bugchain_indexer"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Not exposed to the host by default; workers reach it over the compose net.
+
+  deploy-ethereum:
+    build: { context: .., dockerfile: scanners/Dockerfile }
+    restart: always
+    environment:
+      <<: *scanner-env
+      NETWORK: ethereum
+      ETHEREUM_RPC_URL: ${ETHEREUM_RPC_URL:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  gate-ethereum:
+    build: { context: .., dockerfile: scanners/Dockerfile }
+    restart: always
+    command: ["node", "core/FundingGate.js"]
+    environment:
+      <<: *scanner-env
+      NETWORK: ethereum
+      ETHEREUM_RPC_URL: ${ETHEREUM_RPC_URL:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  deploy-base:
+    build: { context: .., dockerfile: scanners/Dockerfile }
+    restart: always
+    environment:
+      <<: *scanner-env
+      NETWORK: base
+      BASE_RPC_URL: ${BASE_RPC_URL:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  gate-base:
+    build: { context: .., dockerfile: scanners/Dockerfile }
+    restart: always
+    command: ["node", "core/FundingGate.js"]
+    environment:
+      <<: *scanner-env
+      NETWORK: base
+      BASE_RPC_URL: ${BASE_RPC_URL:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  deploy-binance:
+    build: { context: .., dockerfile: scanners/Dockerfile }
+    restart: always
+    environment:
+      <<: *scanner-env
+      NETWORK: binance
+      BSC_RPC_URL: ${BSC_RPC_URL:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  gate-binance:
+    build: { context: .., dockerfile: scanners/Dockerfile }
+    restart: always
+    command: ["node", "core/FundingGate.js"]
+    environment:
+      <<: *scanner-env
+      NETWORK: binance
+      BSC_RPC_URL: ${BSC_RPC_URL:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  robinhood-watcher:
+    build: { context: .., dockerfile: scanners/Dockerfile }
+    restart: always
+    command: ["node", "core/RobinhoodWatcher.js"]
+    environment:
+      <<: *scanner-env
+      ROBINHOOD_RPC_URL: ${ROBINHOOD_RPC_URL:-https://rpc.mainnet.chain.robinhood.com}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  gate-robinhood:
+    build: { context: .., dockerfile: scanners/Dockerfile }
+    restart: always
+    command: ["node", "core/FundingGate.js"]
+    environment:
+      <<: *scanner-env
+      NETWORK: robinhood
+      ROBINHOOD_RPC_URL: ${ROBINHOOD_RPC_URL:-https://rpc.mainnet.chain.robinhood.com}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  pgdata:

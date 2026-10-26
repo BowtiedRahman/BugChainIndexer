@@ -1,10 +1,10 @@
 // Robinhood chain deployment watcher. curl-transport (this box's undici
 // times out on AAAA-only DNS). Own state: scan_cursor network='robinhood'.
-require('dotenv').config({ path: '/home/od0gwu/projects/BugChainIndexer/scanners/.env' });
+require('dotenv').config();
 const { execFileSync } = require('child_process');
 const pg = require('pg');
-const { batchUpsertAddresses } = require('/home/od0gwu/projects/BugChainIndexer/scanners/common/database.js');
-const RPC = 'https://rpc.mainnet.chain.robinhood.com';
+const { batchUpsertAddresses } = require('../common/database.js');
+const RPC = process.env.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com';
 const ZERO = '0x0000000000000000000000000000000000000000';
 const CONF = 3, CHUNK = 20;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
