@@ -333,7 +333,7 @@ async function main() {
   await client.connect();
 
   // CoinGecko platform id per network, for token price lookups.
-  const platforms = { ethereum: 'ethereum', binance: 'binance-smart-chain',
+  const platforms = { ethereum: 'ethereum', binance: 'binance-smart-chain', robinhood: 'ethereum',
     polygon: 'polygon-pos', arbitrum: 'arbitrum-one', optimism: 'optimistic-ethereum',
     base: 'base', avalanche: 'avalanche', gnosis: 'xdai' };
   const platformId = platforms[NETWORK] || 'ethereum';
