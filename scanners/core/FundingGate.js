@@ -23,19 +23,29 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// CoinGecko price cache, process-local. Prices move slowly; a gate run
-// doesn't need fresh prices per contract.
+// CoinGecko price lookup. curl subprocess, not node fetch: this machine's
+// DNS hands out only AAAA records for api.coingecko.com and undici times
+// out on them. curl handles it. Cache everything, CoinGecko free tier is
+// 10-30 calls/min and the gate does hundreds per run.
 const priceCache = new Map();
 const PRICE_TTL_MS = 10 * 60 * 1000;
+
+const { execFileSync } = require('child_process');
+
+function httpGetJson(url, timeoutSec = 20) {
+  const out = execFileSync('curl', ['-s', '--max-time', String(timeoutSec), url], {
+    encoding: 'utf8', timeout: (timeoutSec + 5) * 1000
+  });
+  if (!out || out.trim() === '') throw new Error('empty response');
+  return JSON.parse(out);
+}
 
 async function priceUsd(platformId, coinId) {
   const key = `${platformId}:${coinId}`;
   const hit = priceCache.get(key);
   if (hit && Date.now() - hit.at < PRICE_TTL_MS) return hit.usd;
   const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`coingecko ${res.status}`);
-  const json = await res.json();
+  const json = httpGetJson(url);
   const usd = json[coinId]?.usd || 0;
   priceCache.set(key, { usd, at: Date.now() });
   return usd;
@@ -69,11 +79,8 @@ async function tokenMetadata(provider, tokenAddr, platformId) {
   let usd = 0;
   try {
     const url = `https://api.coingecko.com/api/v3/simple/token_price/${platformId}?contract_addresses=${key}&vs_currencies=usd`;
-    const res = await fetch(url);
-    if (res.ok) {
-      const json = await res.json();
-      usd = json[key]?.usd || 0;
-    }
+    const json = httpGetJson(url);
+    usd = json[key]?.usd || 0;
   } catch (e) { /* unknown token: value 0 */ }
   const meta = { decimals, usd };
   metaCache.set(key, { meta, at: Date.now() });
@@ -106,12 +113,31 @@ async function portfolioUsd(provider, rpcUrl, address, nativePrice, platformId) 
     const balances = json.result?.tokenBalances ?? [];
     pageKey = json.result?.pageKey;
 
-    for (const t of balances) {
-      if (!t.tokenBalance || t.tokenBalance === '0x0') continue;
+    // CoinGecko public tier allows exactly ONE contract address per
+    // token_price request. Cache makes this survivable; unknown tokens
+    // dominate new deployments anyway and cost one 404-ish miss each.
+    const held = balances.filter(t => t.tokenBalance && t.tokenBalance !== '0x0');
+    const prices = {};
+    for (const t of held.slice(0, 20)) {
+      const key = t.contractAddress.toLowerCase();
+      const hit = priceCache.get(key);
+      if (hit && Date.now() - hit.at < PRICE_TTL_MS) { prices[key] = { usd: hit.usd }; continue; }
       try {
-        const meta = await tokenMetadata(provider, t.contractAddress, platformId);
-        const amount = Number(BigInt(t.tokenBalance)) / (10 ** meta.decimals);
-        usd += amount * meta.usd;
+        const url = `https://api.coingecko.com/api/v3/simple/token_price/${platformId}?contract_addresses=${key}&vs_currencies=usd`;
+        const json = httpGetJson(url);
+        const usd = json[key]?.usd || 0;
+        priceCache.set(key, { usd, at: Date.now() });
+        prices[key] = { usd };
+      } catch (e) { priceCache.set(key, { usd: 0, at: Date.now() }); }
+    }
+
+    for (const t of held) {
+      try {
+        const key = t.contractAddress.toLowerCase();
+        const decimalsHex = await provider.call({ to: t.contractAddress, data: '0x313ce567' });
+        const decimals = parseInt(decimalsHex, 16);
+        const amount = Number(BigInt(t.tokenBalance)) / (10 ** decimals);
+        usd += amount * (prices[key]?.usd || 0);
       } catch (e) { /* skip unreadable token */ }
     }
   } while (pageKey);
@@ -121,13 +147,16 @@ async function portfolioUsd(provider, rpcUrl, address, nativePrice, platformId) 
 
 async function sendTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return false;
+  // curl transport: api.telegram.org is AAAA-only in local DNS, undici hangs.
   try {
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' })
-    });
-    return res.ok;
+    const payload = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' });
+    const out = execFileSync('curl', [
+      '-s', '--max-time', '20', '-X', 'POST',
+      '-H', 'content-type: application/json', '-d', payload,
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`
+    ], { encoding: 'utf8', timeout: 25000 });
+    const json = JSON.parse(out || '{}');
+    return json.ok === true;
   } catch (e) { return false; }
 }
 
@@ -136,18 +165,69 @@ async function runOnce(provider, rpcUrl, client, cfg, nativePrice, platformId) {
 
   // Candidates due for a balance check, newest first. Fresh deploys are the
   // ones being funded right now, so they get checked before old candidates.
+  // Contracts only: EOAs are wallets, not bug-hunt targets, and an EOA that
+  // holds money is normal, not a signal.
   const { rows } = await client.query(`
-    SELECT address, deployer, verified, proxy, risk_score, risk_reasons, first_seen
+    SELECT address, deployer, verified, proxy, risk_score, risk_reasons, first_seen, deployed
     FROM addresses
     WHERE network = $1 AND status = 'candidate'
       AND balance_checked_at < $2
+      AND NOT ('EOA' = ANY(tags))
+      AND 'Contract' = ANY(tags)
     ORDER BY first_seen DESC LIMIT $3`,
     [NETWORK, now - RECHECK_AFTER, GATE_BATCH]);
 
   let promoted = 0;
   for (const row of rows) {
+    // Double-check the address actually has code. The tag may be stale or
+    // wrong; a wallet with money is not a bug-hunt target.
+    let code = '0x';
+    try { code = await provider.getCode(row.address); } catch (e) { /* treat as EOA */ }
+    if (code === '0x') {
+      await client.query(`
+        UPDATE addresses SET balance_checked_at = $1,
+          tags = array_append(array_remove(tags, 'Contract'), 'EOA')
+        WHERE address = $2 AND network = $3`,
+        [now, row.address, NETWORK]);
+      continue;
+    }
+
     const usd = await portfolioUsd(provider, rpcUrl, row.address, nativePrice, platformId);
     const qualifies = usd >= PROMOTE_MIN_USD;
+
+    // Refresh verification state at promotion time. The discovery-time flag
+    // can be stale (Etherscan may have verified the contract since).
+    if (qualifies) {
+      try {
+        const etherscan = require('../common/core.js');
+        const src = await etherscan.etherscanRequest(NETWORK, {
+          module: 'contract', action: 'getsourcecode', address: row.address
+        });
+        const r0 = Array.isArray(src?.result) ? src.result[0] : null;
+        if (r0) {
+          const isVerified = Boolean(r0.SourceCode && String(r0.SourceCode).trim() !== '');
+          row.verified = isVerified;
+          row.contractName = r0.ContractName || null;
+          await client.query(`
+            UPDATE addresses SET verified = $1, contract_name = COALESCE($2, contract_name)
+            WHERE address = $3 AND network = $4`,
+            [isVerified, r0.ContractName || null, row.address, NETWORK]);
+        }
+      } catch (e) { /* keep discovery-time state */ }
+    }
+    if (qualifies && !row.verified) {
+      // A funded but unverified contract is the highest-priority target.
+      // Record it now so the alert and the database agree.
+      const reasons = row.risk_reasons || [];
+      if (!reasons.includes('unverified')) reasons.push('unverified');
+      await client.query(`
+        UPDATE addresses SET risk_score = GREATEST(risk_score, 30),
+          risk_reasons = $1
+        WHERE address = $2 AND network = $3`,
+        [reasons, row.address, NETWORK]);
+      row.risk_score = Math.max(row.risk_score, 30);
+      row.risk_reasons = reasons;
+    }
 
     if (qualifies) {
       await client.query(`
@@ -159,13 +239,20 @@ async function runOnce(provider, rpcUrl, client, cfg, nativePrice, platformId) {
         [Math.floor(usd), now, row.address, NETWORK]);
       promoted++;
 
-      const ageMin = Math.round((now - row.first_seen) / 60);
+      // Age the deployment honestly: block time, not row-insert time.
+      let ageMin = null;
+      try {
+        const block = await provider.getBlock(Number(row.deployed));
+        if (block?.timestamp) ageMin = Math.round((now - block.timestamp) / 60);
+      } catch (e) { /* fall back to first_seen */ }
+      if (ageMin === null) ageMin = Math.round((now - row.first_seen) / 60);
+
       const riskTags = (row.risk_reasons || []).join(', ') || 'none';
       const msg =
 `<b>New funded contract on ${NETWORK}</b>
 Address: <code>${row.address}</code>
-Value: $${Math.floor(usd).toLocaleString()}
-Age: ${ageMin} min
+${row.contractName ? 'Name: ' + row.contractName + '\n' : ''}Value: $${Math.floor(usd).toLocaleString()}
+Age: ${ageMin < 60 ? ageMin + ' min' : ageMin < 1440 ? Math.round(ageMin/60) + ' hours' : Math.round(ageMin/1440) + ' days'}
 Verified: ${row.verified ? 'yes' : 'NO'}
 Proxy: ${row.proxy ? 'yes' : 'no'}
 Risk: ${row.risk_score} (${riskTags})

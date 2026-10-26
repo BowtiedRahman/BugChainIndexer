@@ -54,7 +54,8 @@ async function ensureSchema(client) {
     // Rows that already carry a fund value are promoted immediately, they were
     // found funded by the unified scanner and don't need a gate pass.
     `UPDATE addresses SET status = 'candidate' WHERE status IS NULL`,
-    `UPDATE addresses SET status = 'funded', funded_at = ${'COALESCE(funded_at, last_fund_updated)'} WHERE status = 'candidate' AND fund > 0`,
+    `UPDATE addresses SET status = 'funded', funded_at = COALESCE(funded_at, last_fund_updated)
+       WHERE status = 'candidate' AND fund > 0 AND 'Contract' = ANY(tags)`,
 
     // Proxy upgrades. A proxy pointing at a fresh implementation is the
     // highest-signal bug-hunt feed, so it gets its own table.
