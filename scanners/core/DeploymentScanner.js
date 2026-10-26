@@ -85,6 +85,16 @@ async function main() {
         }
       }
       if (!receipts) continue;
+
+      // Block timestamp for the deployment record. `deployed` is unix-seconds
+      // everywhere else in the schema; storing the block number here rendered
+      // 1970 dates and broke the gate's age filter.
+      let blockTs = null;
+      try {
+        const blk = await provider.getBlock(n);
+        blockTs = blk?.timestamp || null;
+      } catch (e) { blockTs = null; }
+
       for (const r of receipts) {
         if (r.contractAddress &&
             r.contractAddress !== '0x0000000000000000000000000000000000000000') {
@@ -92,7 +102,8 @@ async function main() {
             address: r.contractAddress.toLowerCase(),
             deployer: (r.from || '').toLowerCase(),
             deployTx: r.transactionHash,
-            blockNumber: n
+            blockNumber: n,
+            blockTimestamp: blockTs
           });
         }
       }
@@ -119,7 +130,7 @@ async function main() {
  * rows with risk_reasons recorded - a failed lookup must not lose the deployment.
  */
 async function enrichAndStore(provider, client, deployment) {
-  const { address, deployer, deployTx, blockNumber } = deployment;
+  const { address, deployer, deployTx, blockNumber, blockTimestamp } = deployment;
 
   // EIP-1967 implementation slot
   const EIP1967_IMPL = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
@@ -179,7 +190,7 @@ async function enrichAndStore(provider, client, deployment) {
     network: NETWORK,
     tags: verified ? ['Contract', 'Verified', 'Deployment'] : ['Contract', 'Unverified', 'Deployment'],
     contractName,
-    deployed: blockNumber,
+    deployed: blockTimestamp || Math.floor(Date.now() / 1000),
     lastUpdated: now,
     firstSeen: now,
     verified,

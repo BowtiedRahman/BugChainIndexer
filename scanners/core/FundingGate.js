@@ -167,6 +167,13 @@ async function runOnce(provider, rpcUrl, client, cfg, nativePrice, platformId) {
   // ones being funded right now, so they get checked before old candidates.
   // Contracts only: EOAs are wallets, not bug-hunt targets, and an EOA that
   // holds money is normal, not a signal.
+  // Fresh only: the alert is "new contract just got funded". A MAX_DEPLOY_AGE_HOURS
+  // window on the deployment block (not row time) keeps old contracts from
+  // triggering alerts when they merely move money. 0 disables the filter.
+  const maxDeployAge = Number(process.env.MAX_DEPLOY_AGE_HOURS || 24);
+  const ageCutoff = maxDeployAge > 0
+    ? Math.floor(now - maxDeployAge * 3600) * 1000
+    : 0;
   const { rows } = await client.query(`
     SELECT address, deployer, verified, proxy, risk_score, risk_reasons, first_seen, deployed
     FROM addresses
@@ -174,8 +181,9 @@ async function runOnce(provider, rpcUrl, client, cfg, nativePrice, platformId) {
       AND balance_checked_at < $2
       AND NOT ('EOA' = ANY(tags))
       AND 'Contract' = ANY(tags)
+      AND deployed IS NOT NULL AND deployed > 0 AND deployed * 1000 >= $4
     ORDER BY first_seen DESC LIMIT $3`,
-    [NETWORK, now - RECHECK_AFTER, GATE_BATCH]);
+    [NETWORK, now - RECHECK_AFTER, GATE_BATCH, ageCutoff]);
 
   let promoted = 0;
   for (const row of rows) {
@@ -198,8 +206,38 @@ async function runOnce(provider, rpcUrl, client, cfg, nativePrice, platformId) {
     // Refresh verification state at promotion time. The discovery-time flag
     // can be stale (Etherscan may have verified the contract since).
     if (qualifies) {
+      const etherscan = require('../common/core.js');
+
+      // Backfill deployment facts when discovery left them blank, so the
+      // alert prints the real deploy date and the row keeps them forever.
+      if (!row.deployer || !row.deployed) {
+        try {
+          const cc = await etherscan.etherscanRequest(NETWORK, {
+            module: 'contract', action: 'getcontractcreation', contractaddresses: row.address
+          });
+          const c0 = Array.isArray(cc?.result) ? cc.result[0] : null;
+          if (c0?.blockNumber && c0.blockNumber !== '0') {
+            const blockNum = Number(c0.blockNumber);
+            const deployer = (c0.contractCreator || '').toLowerCase();
+            let deployTs = null;
+            try {
+              const blk = await provider.getBlock(blockNum);
+              deployTs = blk?.timestamp || null;
+            } catch (e) { /* keep null; block may be pruned */ }
+            // `deployed` stores a unix-seconds timestamp everywhere else in
+            // the schema (Scanner.initialize, alerts, indexes). Block numbers
+            // here would render as 1970 dates and break the age filter.
+            await client.query(`
+              UPDATE addresses SET deployer = $1, deploy_tx = $2, deployed = $3
+              WHERE address = $4 AND network = $5`,
+              [deployer, c0.txHash || null, deployTs, row.address, NETWORK]);
+            row.deployed = deployTs;
+            row.deployer = deployer;
+          }
+        } catch (e) { /* deployment lookup failed; keep nulls */ }
+      }
+
       try {
-        const etherscan = require('../common/core.js');
         const src = await etherscan.etherscanRequest(NETWORK, {
           module: 'contract', action: 'getsourcecode', address: row.address
         });
