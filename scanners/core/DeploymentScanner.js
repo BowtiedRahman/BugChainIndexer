@@ -56,13 +56,34 @@ async function main() {
   console.log(`[${NETWORK}] starting at block ${from}, confirmations=${CONFIRMATIONS}, chunk=${CHUNK}`);
 
   for (;;) {
-    const head = (await provider.getBlockNumber()) - CONFIRMATIONS;
+    let head;
+    try {
+      head = (await provider.getBlockNumber()) - CONFIRMATIONS;
+    } catch (e) {
+      console.error(`[${NETWORK}] getBlockNumber failed, retrying: ${e.message.slice(0, 50)}`);
+      await sleep(5000);
+      continue;
+    }
     if (head < from) { await sleep(5000); continue; }
     const to = Math.min(from + CHUNK - 1, head);
 
     const found = [];
     for (let n = from; n <= to; n++) {
-      const receipts = await provider.send('eth_getBlockReceipts', [ethers.toBeHex(n)]);
+      // Alchemy free tier 429s under sustained eth_getBlockReceipts load and
+      // returns an empty body. Retry with backoff; give up after 5 tries.
+      let receipts = null;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          receipts = await provider.send('eth_getBlockReceipts', [ethers.toBeHex(n)]);
+          if (receipts) break;
+        } catch (e) {
+          if (attempt < 4) {
+            await sleep(2000 * (attempt + 1));
+          } else {
+            console.error(`[${NETWORK}] block ${n} receipts failed after 5 attempts: ${e.message.slice(0, 60)}`);
+          }
+        }
+      }
       if (!receipts) continue;
       for (const r of receipts) {
         if (r.contractAddress &&
@@ -79,6 +100,9 @@ async function main() {
 
     // Enrich each deployment, then insert.
     for (const d of found) await enrichAndStore(provider, client, d);
+
+    // Pace the chunk: ~2 blocks/sec keeps sustained 429s away on free tier.
+    await sleep(CHUNK * 500);
 
     await client.query(`INSERT INTO scan_cursor (network, last_block)
       VALUES ($1,$2) ON CONFLICT (network) DO UPDATE SET
