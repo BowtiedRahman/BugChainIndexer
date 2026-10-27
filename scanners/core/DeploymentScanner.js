@@ -49,9 +49,70 @@ async function main() {
 
   const { rows } = await client.query(
     `SELECT last_block FROM scan_cursor WHERE network = $1`, [NETWORK]);
-  let from = rows.length
+
+  // BACKFILL mode: FROM_BLOCK/TO_BLOCK env (block numbers) or FROM_DATE/TO_DATE
+  // (YYYY-MM-DD, converted via binary search on block timestamps). Scans the
+  // given range once, never updates scan_cursor, then exits. The live loop's
+  // cursor stays untouched, so backfill and live scanning don't fight.
+  const envFrom = process.env.FROM_BLOCK;
+  const envTo = process.env.TO_BLOCK;
+  const envFromDate = process.env.FROM_DATE;
+  const envToDate = process.env.TO_DATE;
+  let backfill = null;
+  if (envFrom || envFromDate) {
+    let fromB = envFrom ? Number(envFrom) : null;
+    let toB = envTo ? Number(envTo) : null;
+    const toTs = envToDate ? Math.floor(new Date(envToDate + 'T23:59:59Z').getTime() / 1000) : null;
+    const fromTs = envFromDate ? Math.floor(new Date(envFromDate + 'T00:00:00Z').getTime() / 1000) : null;
+
+    async function blockAtTimestamp(ts) {
+      // binary search between a known low and high block
+      let lo = 1, hi = await provider.getBlockNumber();
+      let best = hi;
+      while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        let blk;
+        for (let a = 0; a < 3; a++) {
+          try { blk = await provider.getBlock(mid); break; } catch (e) { blk = null; await sleep(1000); }
+        }
+        if (!blk) { lo = mid + 1; continue; }
+        if (blk.timestamp < ts) lo = mid + 1; else { best = mid; hi = mid - 1; }
+      }
+      return best;
+    }
+
+    if (fromB === null && fromTs !== null) {
+      fromB = await blockAtTimestamp(fromTs);
+      console.log(`[${NETWORK}] FROM_DATE ${envFromDate} -> block ${fromB}`);
+    }
+    if (toB === null && toTs !== null) {
+      toB = (await blockAtTimestamp(toTs));
+      console.log(`[${NETWORK}] TO_DATE ${envToDate} -> block ${toB}`);
+    }
+    if (toB === null) toB = (await provider.getBlockNumber()) - CONFIRMATIONS;
+    if (fromB > toB) { console.error(`[${NETWORK}] empty range ${fromB}-${toB}`); process.exit(1); }
+    backfill = { from: fromB, to: toB };
+  }
+
+  const liveFrom = rows.length
     ? Number(rows[0].last_block) + 1
     : (await provider.getBlockNumber());
+
+  if (backfill) {
+    console.log(`[${NETWORK}] BACKFILL mode: blocks ${backfill.from} -> ${backfill.to} (${backfill.to - backfill.from + 1} blocks)`);
+    for (let n = backfill.from; n <= backfill.to; n += CHUNK) {
+      const to = Math.min(n + CHUNK - 1, backfill.to);
+      let total = 0;
+      for (let b = n; b <= to; b++) {
+        total += await scanBlock(provider, client, b);
+      }
+      console.log(`[${NETWORK}] backfill ${n}-${to} done (${total} deployments)`);
+    }
+    console.log(`[${NETWORK}] backfill complete, exiting`);
+    process.exit(0);
+  }
+
+  let from = liveFrom;
 
   console.log(`[${NETWORK}] starting at block ${from}, confirmations=${CONFIRMATIONS}, chunk=${CHUNK}`);
 
@@ -67,51 +128,14 @@ async function main() {
     if (head < from) { await sleep(5000); continue; }
     const to = Math.min(from + CHUNK - 1, head);
 
-    const found = [];
+    let foundCount = 0;
     for (let n = from; n <= to; n++) {
-      // Alchemy free tier 429s under sustained eth_getBlockReceipts load and
-      // returns an empty body. Retry with backoff; give up after 5 tries.
-      let receipts = null;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        try {
-          receipts = await provider.send('eth_getBlockReceipts', [ethers.toBeHex(n)]);
-          if (receipts) break;
-        } catch (e) {
-          if (attempt < 4) {
-            await sleep(2000 * (attempt + 1));
-          } else {
-            console.error(`[${NETWORK}] block ${n} receipts failed after 5 attempts: ${e.message.slice(0, 60)}`);
-          }
-        }
-      }
-      if (!receipts) continue;
-
-      // Block timestamp for the deployment record. `deployed` is unix-seconds
-      // everywhere else in the schema; storing the block number here rendered
-      // 1970 dates and broke the gate's age filter.
-      let blockTs = null;
-      try {
-        const blk = await provider.getBlock(n);
-        blockTs = blk?.timestamp || null;
-      } catch (e) { blockTs = null; }
-
-      for (const r of receipts) {
-        if (r.contractAddress &&
-            r.contractAddress !== '0x0000000000000000000000000000000000000000') {
-          found.push({
-            address: r.contractAddress.toLowerCase(),
-            deployer: (r.from || '').toLowerCase(),
-            deployTx: r.transactionHash,
-            blockNumber: n,
-            blockTimestamp: blockTs
-          });
-        }
-      }
+      foundCount += await scanBlock(provider, client, n);
     }
 
-    // Enrich each deployment, then insert.
-    for (const d of found) await enrichAndStore(provider, client, d);
-
+    if (foundCount > 0) {
+      console.log(`[${NETWORK}] scanned ${from}-${to}, ${foundCount} deployments`);
+    }
     // Pace the chunk: ~2 blocks/sec keeps sustained 429s away on free tier.
     await sleep(CHUNK * 500);
 
@@ -119,9 +143,56 @@ async function main() {
       VALUES ($1,$2) ON CONFLICT (network) DO UPDATE SET
       last_block = EXCLUDED.last_block, updated_at = NOW()`, [NETWORK, to]);
 
-    console.log(`[${new Date().toISOString()}][${NETWORK}] scanned ${from}-${to}, ${found.length} deployments`);
     from = to + 1;
   }
+}
+
+/**
+ * Scan one block's receipts for contract deployments, enrich, store.
+ * Shared by the live loop and backfill mode. Returns deployments found.
+ */
+async function scanBlock(provider, client, n) {
+  // Alchemy free tier 429s under sustained eth_getBlockReceipts load and
+  // returns an empty body. Retry with backoff; give up after 5 tries.
+  let receipts = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      receipts = await provider.send('eth_getBlockReceipts', [ethers.toBeHex(n)]);
+      if (receipts) break;
+    } catch (e) {
+      if (attempt < 4) {
+        await sleep(2000 * (attempt + 1));
+      } else {
+        console.error(`[${NETWORK}] block ${n} receipts failed after 5 attempts: ${e.message.slice(0, 60)}`);
+      }
+    }
+  }
+  if (!receipts) return 0;
+
+  // Block timestamp for the deployment record. `deployed` is unix-seconds
+  // everywhere else in the schema; storing the block number here rendered
+  // 1970 dates and broke the gate's age filter.
+  let blockTs = null;
+  try {
+    const blk = await provider.getBlock(n);
+    blockTs = blk?.timestamp || null;
+  } catch (e) { blockTs = null; }
+
+  let count = 0;
+  for (const r of receipts) {
+    if (r.contractAddress &&
+        r.contractAddress !== '0x0000000000000000000000000000000000000000') {
+      count++;
+      await enrichAndStore(provider, client, {
+        address: r.contractAddress.toLowerCase(),
+        deployer: (r.from || '').toLowerCase(),
+        deployTx: r.transactionHash,
+        blockNumber: n,
+        blockTimestamp: blockTs
+      });
+    }
+  }
+  return count;
 }
 
 /**
