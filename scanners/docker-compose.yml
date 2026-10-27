@@ -103,26 +103,5 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
 
-  robinhood-watcher:
-    build: { context: .., dockerfile: scanners/Dockerfile }
-    restart: always
-    command: ["node", "core/RobinhoodWatcher.js"]
-    environment:
-      <<: *scanner-env
-      ROBINHOOD_RPC_URL: ${ROBINHOOD_RPC_URL:-https://rpc.mainnet.chain.robinhood.com}
-    depends_on:
-      postgres: { condition: service_healthy }
-
-  gate-robinhood:
-    build: { context: .., dockerfile: scanners/Dockerfile }
-    restart: always
-    command: ["node", "core/FundingGate.js"]
-    environment:
-      <<: *scanner-env
-      NETWORK: robinhood
-      ROBINHOOD_RPC_URL: ${ROBINHOOD_RPC_URL:-https://rpc.mainnet.chain.robinhood.com}
-    depends_on:
-      postgres: { condition: service_healthy }
-
 volumes:
   pgdata:

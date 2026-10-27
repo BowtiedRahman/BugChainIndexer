@@ -169,6 +169,14 @@ const NETWORKS = {
 
 // Additional networks with proper configurations
 const ADDITIONAL_NETWORKS = {
+  robinhood: {
+    chainId: 4663,
+    name: 'robinhood',
+    rpcUrls: ['https://rpc.mainnet.chain.robinhood.com'],
+    nativeCurrency: 'ETH',
+    contractValidator: null,
+    BalanceHelper: null
+  },
   gnosis: {
     chainId: 100,
     name: 'Gnosis Chain',
@@ -254,21 +262,6 @@ const ADDITIONAL_NETWORKS = {
     BalanceHelper: '0x6F4A97C44669a74Ee6b6EE95D2cD6C4803F6b384'
   },
 
-  robinhood: {
-    chainId: 4663,
-    name: 'Robinhood Chain',
-
-    // Arbitrum Orbit L2, tokenized RWA focus. Alchemy supports the chain but
-    // this API key doesn't have it enabled; the public RPC is the default.
-    rpcUrls: envArray('ROBINHOOD_RPC_URL', [
-      'https://rpc.mainnet.chain.robinhood.com'
-    ]),
-    nativeCurrency: 'ETH',
-    // No helper contracts deployed on this chain yet; the unified scanner
-    // requires them, so use `deployments` + `gate` workers only for now.
-    contractValidator: null,
-    BalanceHelper: null
-  },
 
   'polygon-zkevm': {
     chainId: 1101,

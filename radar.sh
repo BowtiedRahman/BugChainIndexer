@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
-# BugChainIndexer control: start, stop, status for the whole radar.
+# BugChainIndexer control: start, stop, status, logs, chain management.
 #
-#   ./radar.sh start     postgres + watchers + gates for all chains
-#   ./radar.sh stop      everything (data persists in docker volume)
-#   ./radar.sh status    what's running, chain progress, last alert
-#   ./radar.sh logs      tail all worker logs
+#   ./radar.sh start                 postgres + scanners + gates for all ACTIVE chains
+#   ./radar.sh stop                  all workers (postgres and data stay)
+#   ./radar.sh status                workers, row counts, per-chain progress
+#   ./radar.sh logs                  tail worker logs
 #
-# Chains: ethereum, binance, base, robinhood. Add more in CHAINS below.
+#   ./radar.sh chains                list known chains and which are active
+#   ./radar.sh add <chain>           activate a chain already in config/networks.js
+#   ./radar.sh remove <chain>        deactivate: stop its workers, keep its data
+#   ./radar.sh newchain <id> <chainId> <rpcUrl> <symbol>   add a brand-new chain
+#                                    to config + activate it in one step
+#
+# Active chains live in scanners/chains.txt (one per line). That file is the
+# single source of truth; every command reads it. Data for a removed chain
+# stays in Postgres until you delete it by hand.
 set -uo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 S="$BASE/BugChainIndexer/scanners"
-CHAINS=(ethereum binance base)
 LOGD="$BASE/logs"
+CHAINS_FILE="$S/chains.txt"
 mkdir -p "$LOGD"
 
 # ---------- helpers ----------
@@ -30,35 +38,39 @@ ensure_postgres() {
   echo "postgres failed to become ready" >&2; return 1
 }
 
-worker_pids() { pgrep -f 'core/(DeploymentScanner|FundingGate|RobinhoodWatcher)\.js' 2>/dev/null; }
+worker_pids() { pgrep -f 'core/(DeploymentScanner|FundingGate)\.js' 2>/dev/null; }
 
-start_worker() { # $1=name $2=script $3=network $4=logfile
-  pgrep -f "node .*core/$2" | grep -v "^\$$" >/dev/null 2>&1 && return 0
-  local env_net=""
-  [ "$3" != "-" ] && env_net="NETWORK=$3"
-  # cwd must be $S so dotenv.config() finds scanners/.env.
-  # setsid detaches from the terminal's session so closing the terminal
-  # (SIGHUP) doesn't kill the worker. Plain nohup+& dies here.
-  (cd "$S" && setsid nohup env $env_net node "core/$2" >> "$LOGD/$4" 2>&1 < /dev/null &)
-  echo "  started $1"
+active_chains() { [ -f "$CHAINS_FILE" ] && grep -vE '^\s*(#|$)' "$CHAINS_FILE"; }
+
+known_chains() {
+  # Run from $S so node resolves dotenv/deno-installed modules.
+  # grep keeps only bare chain-name lines; dotenv's banner lines contain
+  # spaces/symbols and get dropped.
+  (cd "$S" && node -e 'require("dotenv").config();const{NETWORKS}=require("./config/networks.js");console.log(Object.keys(NETWORKS).join("\n"))' 2>/dev/null | grep -E '^[a-z0-9-]+$')
 }
 
-# ---------- commands ----------
+worker_running() { # $1=chain $2=script-name
+  for p in $(worker_pids); do
+    local net; net=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep '^NETWORK=' | cut -d= -f2)
+    [ "$net" = "$1" ] && ps -o args= -p $p | grep -q "$2" && return 0
+  done
+  return 1
+}
+
+start_worker() { # $1=chain $2=script-file $3=logfile
+  worker_running "$1" "$2" && { echo "  $1 $2 already running"; return 0; }
+  (cd "$S" && setsid nohup env NETWORK="$1" node "core/$2" >> "$LOGD/$3" 2>&1 < /dev/null &)
+  echo "  started $1 $2"
+}
+
+# ---------- start/stop ----------
 cmd_start() {
   echo "==> postgres"
   ensure_postgres && echo "  ready"
-  echo "==> deployment scanners"
-  for net in "${CHAINS[@]}"; do
-    start_worker "deploy-$net" DeploymentScanner.js "$net" "deploy-$net.log"
-  done
-  # robinhood uses its own curl-transport watcher (ethers stalls on this box)
-  pgrep -f 'core/RobinhoodWatcher.js' >/dev/null || {
-    (cd "$S" && setsid nohup node core/RobinhoodWatcher.js >> "$LOGD/deploy-robinhood.log" 2>&1 < /dev/null &)
-    echo "  started deploy-robinhood"
-  }
-  echo "==> funding gates"
-  for net in "${CHAINS[@]}" robinhood; do
-    start_worker "gate-$net" FundingGate.js "$net" "gate-$net.log"
+  echo "==> workers for active chains ($(active_chains | tr '\n' ' '))"
+  for net in $(active_chains); do
+    start_worker "$net" DeploymentScanner.js "deploy-$net.log"
+    start_worker "$net" FundingGate.js "gate-$net.log"
   done
   sleep 2
   cmd_status
@@ -67,23 +79,21 @@ cmd_start() {
 cmd_stop() {
   local pids; pids=$(worker_pids)
   if [ -n "$pids" ]; then
-    kill $pids 2>/dev/null
-    sleep 2
-    pids=$(worker_pids)
-    [ -n "$pids" ] && kill -9 $pids 2>/dev/null
-    echo "stopped $(echo $pids | wc -w) workers"
+    kill $pids 2>/dev/null; sleep 2
+    pids=$(worker_pids); [ -n "$pids" ] && kill -9 $pids 2>/dev/null
+    echo "stopped all workers"
   else
     echo "no workers running"
   fi
-  # postgres stays up: data survives, and stopping it earns nothing.
-  echo "(postgres left running; 'docker stop bugchain-pg' stops it too)"
+  echo "(postgres left running; data persists)"
 }
 
+# ---------- status ----------
 cmd_status() {
   echo "== workers"
   local pids; pids=$(worker_pids)
   if [ -z "$pids" ]; then
-    echo "  none running"
+    echo "  none running (./radar.sh start)"
   else
     for p in $pids; do
       local net; net=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep '^NETWORK=' | cut -d= -f2 || echo '?')
@@ -95,18 +105,99 @@ cmd_status() {
   if pg_up; then
     docker exec bugchain-pg psql -U postgres -d bugchain_indexer -tAc \
       "SELECT '  rows=' || count(*) || ' funded=' || count(*) FILTER (WHERE status='funded') || ' candidates=' || count(*) FILTER (WHERE status='candidate') FROM addresses"
-    for net in "${CHAINS[@]}" robinhood; do
+    for net in $(active_chains); do
       local blk; blk=$(docker exec bugchain-pg psql -U postgres -d bugchain_indexer -tAc \
         "SELECT last_block FROM scan_cursor WHERE network='$net'" 2>/dev/null)
-      [ -n "$blk" ] && [ "$blk" != "0" ] && echo "  $net cursor: block $blk"
+      local cnt; cnt=$(docker exec bugchain-pg psql -U postgres -d bugchain_indexer -tAc \
+        "SELECT count(*) FROM addresses WHERE network='$net'" 2>/dev/null)
+      echo "  $net: $cnt rows, cursor block ${blk:-none}"
     done
   else
     echo "  DOWN"
   fi
+  echo "== active chains: $(active_chains | tr '\n' ' ')"
 }
 
-cmd_logs() {
-  tail -n 40 -f "$LOGD"/deploy-*.log "$LOGD"/gate-*.log 2>/dev/null
+cmd_logs() { tail -n 40 -f "$LOGD"/deploy-*.log "$LOGD"/gate-*.log 2>/dev/null; }
+
+# ---------- chain management ----------
+cmd_chains() {
+  echo "known chains (in config/networks.js):"
+  for c in $(known_chains); do
+    local active=""; active_chains | grep -qx "$c" && active=" [ACTIVE]"
+    echo "  $c$active"
+  done
+}
+
+cmd_add() { # $1=chain
+  local c="$1"
+  [ -z "$c" ] && { echo "usage: radar.sh add <chain>"; exit 1; }
+  known_chains | grep -qx "$c" || { echo "unknown chain '$c'. Known: $(known_chains | tr '\n' ' ')"; exit 1; }
+  active_chains | grep -qx "$c" && { echo "$c already active"; exit 0; }
+  echo "$c" >> "$CHAINS_FILE"
+  sort -u -o "$CHAINS_FILE" "$CHAINS_FILE"
+  echo "$c activated. running: ./radar.sh start picks it up."
+  if pg_up; then
+    echo "starting its workers now:"
+    start_worker "$c" DeploymentScanner.js "deploy-$c.log"
+    start_worker "$c" FundingGate.js "gate-$c.log"
+  fi
+}
+
+cmd_remove() { # $1=chain
+  local c="$1"
+  [ -z "$c" ] && { echo "usage: radar.sh remove <chain>"; exit 1; }
+  if [ -f "$CHAINS_FILE" ]; then
+    grep -vE "^${c}\$" "$CHAINS_FILE" > "$CHAINS_FILE.tmp" && mv "$CHAINS_FILE.tmp" "$CHAINS_FILE"
+  fi
+  # kill just this chain's workers
+  for p in $(worker_pids); do
+    local net; net=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep '^NETWORK=' | cut -d= -f2)
+    [ "$net" = "$c" ] && kill "$p" 2>/dev/null
+  done
+  echo "$c deactivated. Its rows stay in Postgres; delete with:"
+  echo "  docker exec bugchain-pg psql -U postgres -d bugchain_indexer -c \"DELETE FROM addresses WHERE network='$c'; DELETE FROM scan_cursor WHERE network='$c';\""
+}
+
+cmd_newchain() { # $1=slug $2=chainId $3=rpcUrl $4=symbol
+  local slug="$1" cid="$2" rpc="$3" sym="$4"
+  [ -z "$slug" ] || [ -z "$cid" ] || [ -z "$rpc" ] || [ -z "$sym" ] && {
+    echo "usage: radar.sh newchain <slug> <chainId> <rpcUrl> <nativeSymbol>"; echo 'example: radar.sh newchain arbitrum 42161 https://arb1.arbitrum.io/rpc ETH'; exit 1; }
+  known_chains | grep -qx "$slug" && { echo "$slug already exists in config"; exit 1; }
+  # Append a minimal network entry. No helper contracts: the unified scanner
+  # skips this chain, but DeploymentScanner and FundingGate work everywhere.
+  cat >> "$S/config/networks.js.tmp" << EOF
+
+  $slug: {
+    chainId: $cid,
+    name: '$slug',
+    rpcUrls: ['$rpc'],
+    nativeCurrency: '$sym',
+    contractValidator: null,
+    BalanceHelper: null
+  },
+EOF
+  # Insert the new network into ADDITIONAL_NETWORKS (the second chain object,
+  # starts at `const ADDITIONAL_NETWORKS = {`). Anchoring on its declaration
+  # and inserting right after is always syntactically valid; anchoring on
+  # CONFIG failed because NETWORKS/ADDITIONAL_NETWORKS close above it.
+  node - "$S/config/networks.js" "$S/config/networks.js.tmp" << 'NODEEOF'
+const fs = require('fs');
+const [path, tmpPath] = process.argv.slice(2);
+const src = fs.readFileSync(path, 'utf8');
+const addition = fs.readFileSync(tmpPath, 'utf8');
+const anchor = 'const ADDITIONAL_NETWORKS = {';
+const idx = src.indexOf(anchor);
+if (idx === -1) { console.error('cannot find ADDITIONAL_NETWORKS'); process.exit(1); }
+// insert just after the opening brace line
+const insertAt = src.indexOf('\n', idx) + 1;
+fs.writeFileSync(path, src.slice(0, insertAt) + addition.replace(/^\n/, '') + src.slice(insertAt));
+NODEEOF
+  rm -f "$S/config/networks.js.tmp"
+node --check "$S/config/networks.js" || { echo "config broken; reverting"; git -C "$S/.." checkout -- "$S/config/networks.js"; exit 1; }
+echo "$slug" >> "$CHAINS_FILE"
+sort -u -o "$CHAINS_FILE" "$CHAINS_FILE"
+echo "$slug added (chainId $cid) and activated. Workers start on next ./radar.sh start, or run: ./radar.sh add $slug"
 }
 
 case "${1:-status}" in
@@ -114,5 +205,9 @@ case "${1:-status}" in
   stop) cmd_stop ;;
   status|'') cmd_status ;;
   logs) cmd_logs ;;
-  *) echo "usage: $0 {start|stop|status|logs}"; exit 1 ;;
+  chains) cmd_chains ;;
+  add) cmd_add "$2" ;;
+  remove) cmd_remove "$2" ;;
+  newchain) cmd_newchain "$2" "$3" "$4" "$5" ;;
+  *) echo "usage: $0 {start|stop|status|logs|chains|add <chain>|remove <chain>|newchain <slug> <chainId> <rpc> <symbol>}"; exit 1 ;;
 esac
