@@ -18,7 +18,12 @@
 set -uo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-S="$BASE/BugChainIndexer/scanners"
+# scanners/ sits next to this script when run from the repo root, or one
+# level under BugChainIndexer/ when run from a parent checkout folder.
+if   [ -d "$BASE/scanners" ];                then S="$BASE/scanners"
+elif [ -d "$BASE/BugChainIndexer/scanners" ]; then S="$BASE/BugChainIndexer/scanners"
+else echo "$0: cannot locate scanners/ relative to $BASE" >&2; exit 1
+fi
 LOGD="$BASE/logs"
 CHAINS_FILE="$S/chains.txt"
 mkdir -p "$LOGD"
@@ -200,14 +205,32 @@ sort -u -o "$CHAINS_FILE" "$CHAINS_FILE"
 echo "$slug added (chainId $cid) and activated. Workers start on next ./radar.sh start, or run: ./radar.sh add $slug"
 }
 
+cmd_backfill() { # $1=chain $2=from-date-or-block $3=to-date-or-block
+  local c="$1" fromArg="$2" toArg="$3"
+  [ -z "$c" ] || [ -z "$fromArg" ] && { echo "usage: radar.sh backfill <chain> <from-date|block> [to-date|block]"; echo 'example: radar.sh backfill binance 2025-09-01           # sept 1 to now'; echo '         radar.sh backfill binance 2025-09-01 2025-10-01  # explicit range'; echo '         radar.sh backfill binance 48000000 49500000      # block numbers'; exit 1; }
+  ensure_postgres
+  local envs="NETWORK=$c"
+  if [[ "$fromArg" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    envs="$envs FROM_DATE=$fromArg"
+  else
+    envs="$envs FROM_BLOCK=$fromArg"
+  fi
+  if [ -n "$toArg" ]; then
+    if [[ "$toArg" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then envs="$envs TO_DATE=$toArg"; else envs="$envs TO_BLOCK=$toArg"; fi
+  fi
+  echo "backfilling $c ($envs). Runs in foreground; live cursor untouched."
+  (cd "$S" && exec env $envs node core/DeploymentScanner.js)
+}
+
 case "${1:-status}" in
   start) cmd_start ;;
   stop) cmd_stop ;;
   status|'') cmd_status ;;
   logs) cmd_logs ;;
   chains) cmd_chains ;;
-  add) cmd_add "$2" ;;
-  remove) cmd_remove "$2" ;;
-  newchain) cmd_newchain "$2" "$3" "$4" "$5" ;;
-  *) echo "usage: $0 {start|stop|status|logs|chains|add <chain>|remove <chain>|newchain <slug> <chainId> <rpc> <symbol>}"; exit 1 ;;
+  add) cmd_add "${2:-}" ;;
+  remove) cmd_remove "${2:-}" ;;
+  newchain) cmd_newchain "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+  backfill) cmd_backfill "${2:-}" "${3:-}" "${4:-}" ;;
+  *) echo "usage: $0 {start|stop|status|logs|chains|add <chain>|remove <chain>|newchain <slug> <chainId> <rpc> <symbol>|backfill <chain> <from> [to]}"; exit 1 ;;
 esac
