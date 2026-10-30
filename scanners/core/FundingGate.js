@@ -44,9 +44,9 @@ async function priceUsd(platformId, coinId) {
   const key = `${platformId}:${coinId}`;
   const hit = priceCache.get(key);
   if (hit && Date.now() - hit.at < PRICE_TTL_MS) return hit.usd;
-  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`;
-  const json = httpGetJson(url);
-  const usd = json[coinId]?.usd || 0;
+  // DefiLlama native prices via coingecko-compatible id.
+  const json = await (await fetch(`https://coins.llama.fi/prices/current/coingecko:${coinId}`)).json();
+  const usd = json.coins?.[`coingecko:${coinId}`]?.price || 0;
   priceCache.set(key, { usd, at: Date.now() });
   return usd;
 }
@@ -59,32 +59,6 @@ async function getNativePriceUsd(cfg) {
   const id = ids[cfg.nativeCurrency] || 'ethereum';
   if (!id) return 0;
   try { return await priceUsd('native', id); } catch (e) { return 0; }
-}
-
-// ERC-20 token metadata cache. alchemy_getTokenBalances returns raw balances
-// with per-token decimals, so we need decimals (and address for pricing).
-const metaCache = new Map();
-const META_TTL_MS = 24 * 60 * 60 * 1000;
-
-async function tokenMetadata(provider, tokenAddr, platformId) {
-  const key = tokenAddr.toLowerCase();
-  const hit = metaCache.get(key);
-  if (hit && Date.now() - hit.at < META_TTL_MS) return hit.meta;
-  // Decimals via eth_call; alchemy_getTokenMetadata is a paid feature.
-  const decimalsHex = await provider.call({
-    to: tokenAddr, data: '0x313ce567' // decimals()
-  });
-  const decimals = parseInt(decimalsHex, 16);
-  // Price via CoinGecko contract-address lookup; falls back to 0 on miss.
-  let usd = 0;
-  try {
-    const url = `https://api.coingecko.com/api/v3/simple/token_price/${platformId}?contract_addresses=${key}&vs_currencies=usd`;
-    const json = httpGetJson(url);
-    usd = json[key]?.usd || 0;
-  } catch (e) { /* unknown token: value 0 */ }
-  const meta = { decimals, usd };
-  metaCache.set(key, { meta, at: Date.now() });
-  return meta;
 }
 
 /**
@@ -113,22 +87,36 @@ async function portfolioUsd(provider, rpcUrl, address, nativePrice, platformId) 
     const balances = json.result?.tokenBalances ?? [];
     pageKey = json.result?.pageKey;
 
-    // CoinGecko public tier allows exactly ONE contract address per
-    // token_price request. Cache makes this survivable; unknown tokens
-    // dominate new deployments anyway and cost one 404-ish miss each.
+    // DefiLlama prices: free, no key, batched (up to ~100 coins per call),
+    // and reachable via node fetch on this box where CoinGecko hangs.
+    // Coin format: <platform>:<token address>. Fallback to CoinGecko stays
+    // in git history; llama covers the same tokens.
     const held = balances.filter(t => t.tokenBalance && t.tokenBalance !== '0x0');
     const prices = {};
-    for (const t of held.slice(0, 20)) {
-      const key = t.contractAddress.toLowerCase();
-      const hit = priceCache.get(key);
-      if (hit && Date.now() - hit.at < PRICE_TTL_MS) { prices[key] = { usd: hit.usd }; continue; }
-      try {
-        const url = `https://api.coingecko.com/api/v3/simple/token_price/${platformId}?contract_addresses=${key}&vs_currencies=usd`;
-        const json = httpGetJson(url);
-        const usd = json[key]?.usd || 0;
-        priceCache.set(key, { usd, at: Date.now() });
-        prices[key] = { usd };
-      } catch (e) { priceCache.set(key, { usd: 0, at: Date.now() }); }
+    if (held.length > 0) {
+      const uncached = held.map(t => t.contractAddress.toLowerCase())
+        .filter(a => { const h = priceCache.get(a); return !(h && Date.now() - h.at < PRICE_TTL_MS); })
+        .slice(0, 100);
+      if (uncached.length > 0) {
+        try {
+          const coins = uncached.map(a => `${platformId}:${a}`).join(',');
+          const r = await fetch(`https://coins.llama.fi/prices/current/${coins}`);
+          if (r.ok) {
+            const j = await r.json();
+            for (const [key, v] of Object.entries(j.coins || {})) {
+              const addr = key.split(':')[1].toLowerCase();
+              priceCache.set(addr, { usd: v.price || 0, at: Date.now() });
+            }
+            for (const a of uncached) {
+              if (!priceCache.has(a)) priceCache.set(a, { usd: 0, at: Date.now() });
+            }
+          }
+        } catch (e) { /* all prices 0 this round */ }
+      }
+      for (const a of held.map(t => t.contractAddress.toLowerCase())) {
+        const h = priceCache.get(a);
+        prices[a] = { usd: h ? h.usd : 0 };
+      }
     }
 
     for (const t of held) {
